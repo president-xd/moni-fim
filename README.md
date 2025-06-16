@@ -265,7 +265,7 @@ File System Changes
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone the repository
-git clone https://github.com/yourusername/moni-fim.git
+git clone https://github.com/president-xd/moni-fim.git
 cd moni-fim
 
 # Install system dependencies
@@ -919,11 +919,11 @@ We follow responsible disclosure practices and will coordinate with reporters.
 #### Documentation
 - **Main Documentation**: This README
 - **API Documentation**: `cargo doc --open`
-- **Wiki**: [GitHub Wiki](https://github.com/yourusername/moni-fim/wiki)
+- **Wiki**: [GitHub Wiki](https://github.com/president-xd/moni-fim/wiki)
 
 #### Community Support
 - **GitHub Issues**: Bug reports and feature requests
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/moni-fim/discussions)
+- **Discussions**: [GitHub Discussions](https://github.com/president/moni-fim/discussions)
 - **Matrix Chat**: `#moni-fim:matrix.org`
 
 #### Professional Support
@@ -970,7 +970,7 @@ Contributors are recognized in our [CONTRIBUTORS.md](CONTRIBUTORS.md) file and r
 
 ## ⭐ Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=yourusername/moni-fim&type=Date)](https://star-history.com/#yourusername/moni-fim&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=president-xd/moni-fim&type=Date)](https://star-history.com/#president-xd/moni-fim&Date)
 
 ---
 
