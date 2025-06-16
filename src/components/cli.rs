@@ -1,13 +1,19 @@
-use crate::components::{baseline, combined, config::Config, formatter, policy, realtime};
+use crate::components::{baseline, combined, config::Config, formatter, logger, policy, realtime};
 use anyhow::{Context, Result};
 use colored::*;
 use crossterm::{
-    event::{self, Event},
+    event::{self, Event, KeyCode},
     terminal::{self, ClearType},
     ExecutableCommand,
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::time::Duration;
+
+// Add this helper function to cli.rs to fix the thread_sleep issue
+fn thread_sleep(millis: u64) {
+    std::thread::sleep(Duration::from_millis(millis));
+}
 
 pub fn run() -> Result<()> {
     let config = Config::load()?;
@@ -170,7 +176,14 @@ fn handle_delete_baseline(config: &Config) -> Result<()> {
 
     println!("{}", "Available baselines:".bright_green());
     for (i, name) in baselines.iter().enumerate() {
-        println!("  {}. {}", i + 1, name);
+        // Try to load baseline to show details
+        let info = match baseline::Baseline::load_unsafe(name, config) {
+            Ok(bl) => format!(" (created: {}, {} files)",
+                              formatter::format_timestamp(bl.created_at),
+                              bl.total_files),
+            Err(_) => " (error loading details)".to_string(),
+        };
+        println!("  {}. {}{}", i + 1, name.bright_yellow(), info.bright_black());
     }
 
     print!("\n{}", "Select baseline to delete (number): ".bright_yellow());
@@ -183,19 +196,34 @@ fn handle_delete_baseline(config: &Config) -> Result<()> {
         if index > 0 && index <= baselines.len() {
             let name = &baselines[index - 1];
 
-            print!("{}", format!("Are you sure you want to delete '{}'? (y/n): ", name).red());
+            println!("{}", format!("Are you sure you want to delete '{}'?", name).red().bold());
+            println!("{}", "This action cannot be undone!".red());
+            print!("{}", "Type 'DELETE' to confirm: ".red().bold());
             io::stdout().flush()?;
 
             let mut confirm = String::new();
             io::stdin().read_line(&mut confirm)?;
 
-            if confirm.trim().to_lowercase() == "y" {
-                baseline::Baseline::delete(name, config)?;
+            if confirm.trim() == "DELETE" {
+                match baseline::Baseline::delete(name, config) {
+                    Ok(()) => {
+                        println!("{}", formatter::format_success(&format!("Baseline '{}' deleted successfully", name)));
+                    }
+                    Err(e) => {
+                        println!("{}", formatter::format_error(&format!("Failed to delete baseline: {}", e)));
+                        logger::log_error(&format!("Delete baseline error: {}", e));
+                    }
+                }
+            } else {
+                println!("{}", formatter::format_info("Delete operation cancelled"));
             }
         } else {
             println!("{}", formatter::format_error("Invalid selection"));
             thread_sleep(2000);
         }
+    } else {
+        println!("{}", formatter::format_error("Invalid input"));
+        thread_sleep(2000);
     }
 
     println!("\n{}", "Press any key to continue...".bright_black());
@@ -243,7 +271,7 @@ fn handle_list_baselines(config: &Config) -> Result<()> {
 
 fn handle_compare_baseline(config: &Config) -> Result<()> {
     clear_screen();
-    println!("{}", "COMPARE WITH BASELINE".cyan().bold());
+    println!("{}", "COMPARE BASELINES".cyan().bold());
     println!("{}", "═".repeat(60).cyan());
 
     let baselines = baseline::Baseline::list_baselines(config)?;
@@ -253,12 +281,69 @@ fn handle_compare_baseline(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    println!("{}", "Available baselines:".bright_green());
-    for (i, name) in baselines.iter().enumerate() {
-        println!("  {}. {}", i + 1, name);
+    if baselines.len() < 2 {
+        println!("{}", formatter::format_warning("Need at least 2 baselines to compare"));
+        println!("{}", "Available options:".bright_green());
+        println!("1. Compare baseline with current filesystem");
+        println!("2. Back to main menu");
+
+        print!("\n{}", "Enter your choice (1-2): ".bright_yellow());
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        match input.trim().parse::<u32>() {
+            Ok(1) => {
+                // Single baseline vs filesystem comparison
+                return handle_baseline_vs_filesystem_comparison(config, &baselines);
+            }
+            _ => return Ok(()),
+        }
     }
 
-    print!("\n{}", "Select baseline to compare (number): ".bright_yellow());
+    println!("{}", "Select comparison type:".bright_green());
+    println!("1. Compare baseline with current filesystem");
+    println!("2. Compare two baselines");
+    println!("3. Back to main menu");
+
+    print!("\n{}", "Enter your choice (1-3): ".bright_yellow());
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    match input.trim().parse::<u32>() {
+        Ok(1) => handle_baseline_vs_filesystem_comparison(config, &baselines),
+        Ok(2) => handle_baseline_vs_baseline_comparison(config, &baselines),
+        _ => Ok(()),
+    }
+}
+
+fn handle_baseline_vs_filesystem_comparison(config: &Config, baselines: &[String]) -> Result<()> {
+    clear_screen();
+    println!("{}", "COMPARE BASELINE WITH FILESYSTEM".cyan().bold());
+    println!("{}", "═".repeat(60).cyan());
+
+    println!("{}", "Available baselines:".bright_green());
+    for (i, name) in baselines.iter().enumerate() {
+        // Show baseline info
+        match baseline::Baseline::load_unsafe(name, config) {
+            Ok(bl) => {
+                println!("  {}. {} {} (created: {}, {} files)",
+                         i + 1,
+                         name.bright_yellow().bold(),
+                         format!("({})", formatter::format_size(bl.total_size)).bright_black(),
+                         formatter::format_timestamp(bl.created_at).bright_black(),
+                         bl.total_files);
+            }
+            Err(_) => {
+                println!("  {}. {} {}", i + 1, name, "(error loading)".red());
+            }
+        }
+    }
+
+    print!("\n{}", "Select baseline to compare with filesystem (number): ".bright_yellow());
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -267,9 +352,52 @@ fn handle_compare_baseline(config: &Config) -> Result<()> {
     if let Ok(index) = input.trim().parse::<usize>() {
         if index > 0 && index <= baselines.len() {
             let name = &baselines[index - 1];
-            let paths = get_paths_to_monitor()?;
 
-            baseline::compare_with_baseline(name, paths, config)?;
+            println!("\n{}", "Comparison options:".bright_green());
+            println!("1. Use paths from baseline (automatic)");
+            println!("2. Specify custom paths");
+
+            print!("\n{}", "Enter your choice (1-2): ".bright_yellow());
+            io::stdout().flush()?;
+
+            let mut choice = String::new();
+            io::stdin().read_line(&mut choice)?;
+
+            let paths = match choice.trim().parse::<u32>() {
+                Ok(1) => {
+                    // Load baseline to get its paths
+                    match baseline::Baseline::load_unsafe(name, config) {
+                        Ok(baseline_data) => {
+                            let unique_paths: std::collections::HashSet<PathBuf> = baseline_data.entries
+                                .keys()
+                                .filter_map(|p| p.parent())
+                                .map(|p| p.to_path_buf())
+                                .collect();
+
+                            let mut paths_vec: Vec<PathBuf> = unique_paths.into_iter().collect();
+                            paths_vec.sort();
+
+                            println!("{}", formatter::format_info(&format!(
+                                "Using {} paths from baseline", paths_vec.len()
+                            )));
+
+                            paths_vec
+                        }
+                        Err(_) => {
+                            println!("{}", formatter::format_warning("Could not load baseline paths, using custom paths"));
+                            get_paths_to_monitor()?
+                        }
+                    }
+                }
+                Ok(2) => get_paths_to_monitor()?,
+                _ => {
+                    println!("{}", formatter::format_error("Invalid choice"));
+                    return Ok(());
+                }
+            };
+
+            // Use the detailed comparison function
+            baseline::compare_with_baseline_detailed(name, paths, config)?;
         } else {
             println!("{}", formatter::format_error("Invalid selection"));
             thread_sleep(2000);
@@ -278,8 +406,289 @@ fn handle_compare_baseline(config: &Config) -> Result<()> {
 
     println!("\n{}", "Press any key to continue...".bright_black());
     wait_for_keypress()?;
+    Ok(())
+}
+
+fn handle_baseline_vs_baseline_comparison(config: &Config, baselines: &[String]) -> Result<()> {
+    clear_screen();
+    println!("{}", "COMPARE TWO BASELINES".cyan().bold());
+    println!("{}", "═".repeat(60).cyan());
+
+    println!("{}", "Available baselines:".bright_green());
+    for (i, name) in baselines.iter().enumerate() {
+        println!("  {}. {}", i + 1, name);
+    }
+
+    // Select first baseline
+    print!("\n{}", "Select FIRST baseline (number): ".bright_yellow());
+    io::stdout().flush()?;
+
+    let mut input1 = String::new();
+    io::stdin().read_line(&mut input1)?;
+
+    let first_index = match input1.trim().parse::<usize>() {
+        Ok(i) if i > 0 && i <= baselines.len() => i - 1,
+        _ => {
+            println!("{}", formatter::format_error("Invalid selection"));
+            thread_sleep(2000);
+            return Ok(());
+        }
+    };
+
+    // Select second baseline
+    print!("{}", "Select SECOND baseline (number): ".bright_yellow());
+    io::stdout().flush()?;
+
+    let mut input2 = String::new();
+    io::stdin().read_line(&mut input2)?;
+
+    let second_index = match input2.trim().parse::<usize>() {
+        Ok(i) if i > 0 && i <= baselines.len() && i - 1 != first_index => i - 1,
+        Ok(i) if i - 1 == first_index => {
+            println!("{}", formatter::format_error("Cannot compare baseline with itself"));
+            thread_sleep(2000);
+            return Ok(());
+        }
+        _ => {
+            println!("{}", formatter::format_error("Invalid selection"));
+            thread_sleep(2000);
+            return Ok(());
+        }
+    };
+
+    let first_name = &baselines[first_index];
+    let second_name = &baselines[second_index];
+
+    // Perform baseline comparison
+    compare_two_baselines(first_name, second_name, config)?;
+
+    println!("\n{}", "Press any key to continue...".bright_black());
+    wait_for_keypress()?;
+    Ok(())
+}
+
+// Add this new function to compare two baselines
+fn compare_two_baselines(first_name: &str, second_name: &str, config: &Config) -> Result<()> {
+    println!("{}", formatter::format_info(&format!(
+        "Comparing '{}' with '{}'...", first_name, second_name
+    )));
+
+    let first_baseline = baseline::Baseline::load_unsafe(first_name, config)?;
+    let second_baseline = baseline::Baseline::load_unsafe(second_name, config)?;
+
+    let mut changes_found = false;
+    let mut additions = 0;
+    let mut modifications = 0;
+    let mut deletions = 0;
+
+    println!("\n{}", "═".repeat(80).cyan());
+    println!("{}", "DETAILED COMPARISON REPORT".cyan().bold());
+    println!("{}", "═".repeat(80).cyan());
+
+    // Show baseline metadata first
+    println!("\n{}", "📊 BASELINE INFORMATION".bright_blue().bold());
+    println!("┌─────────────────────────────────────────────────────────────────────────────┐");
+    println!("│ {} vs {}",
+             format!("Baseline 1: '{}'", first_name).bright_yellow(),
+             format!("Baseline 2: '{}'", second_name).bright_green());
+    println!("│ Created: {} vs {}",
+             formatter::format_timestamp(first_baseline.created_at),
+             formatter::format_timestamp(second_baseline.created_at));
+    println!("│ Files: {} vs {}", first_baseline.total_files, second_baseline.total_files);
+    println!("│ Size: {} vs {}",
+             formatter::format_size(first_baseline.total_size),
+             formatter::format_size(second_baseline.total_size));
+    println!("└─────────────────────────────────────────────────────────────────────────────┘");
+
+    println!("\n{}", "🔍 FILE DIFFERENCES".bright_blue().bold());
+
+    // Files in first but not in second (deletions from first's perspective)
+    let mut first_only_files: Vec<_> = first_baseline.entries
+        .iter()
+        .filter(|(path, _)| !second_baseline.entries.contains_key(*path))
+        .collect();
+    first_only_files.sort_by_key(|(path, _)| *path);
+
+    if !first_only_files.is_empty() {
+        println!("\n{} {} (only in '{}')",
+                 "📁 DELETED FILES".red().bold(),
+                 format!("({})", first_only_files.len()).bright_black(),
+                 first_name);
+        println!("┌─────────────────────────────────────────────────────────────────────────────┐");
+
+        for (path, entry) in first_only_files.iter().take(10) { // Show first 10
+            deletions += 1;
+            changes_found = true;
+            println!("│ {} {}", "-".red().bold(), formatter::format_path(path));
+            println!("│   Size: {} | Modified: {} | Perms: {} | UID:GID {}:{}",
+                     formatter::format_size(entry.size),
+                     formatter::format_timestamp(entry.modified),
+                     formatter::format_permission_octal(entry.permissions),
+                     entry.uid,
+                     entry.gid);
+            println!("│   Hash: {}", formatter::format_hash(&entry.hash));
+            if !entry.xattrs.is_empty() {
+                println!("│   XAttrs: {} attributes", entry.xattrs.len());
+            }
+            println!("│");
+        }
+
+        if first_only_files.len() > 10 {
+            println!("│ ... and {} more files", first_only_files.len() - 10);
+        }
+        println!("└─────────────────────────────────────────────────────────────────────────────┘");
+    }
+
+    // Files in second but not in first (additions to second)
+    let mut second_only_files: Vec<_> = second_baseline.entries
+        .iter()
+        .filter(|(path, _)| !first_baseline.entries.contains_key(*path))
+        .collect();
+    second_only_files.sort_by_key(|(path, _)| *path);
+
+    if !second_only_files.is_empty() {
+        println!("\n{} {} (only in '{}')",
+                 "📁 NEW FILES".green().bold(),
+                 format!("({})", second_only_files.len()).bright_black(),
+                 second_name);
+        println!("┌─────────────────────────────────────────────────────────────────────────────┐");
+
+        for (path, entry) in second_only_files.iter().take(10) { // Show first 10
+            additions += 1;
+            changes_found = true;
+            println!("│ {} {}", "+".green().bold(), formatter::format_path(path));
+            println!("│   Size: {} | Modified: {} | Perms: {} | UID:GID {}:{}",
+                     formatter::format_size(entry.size),
+                     formatter::format_timestamp(entry.modified),
+                     formatter::format_permission_octal(entry.permissions),
+                     entry.uid,
+                     entry.gid);
+            println!("│   Hash: {}", formatter::format_hash(&entry.hash));
+            if !entry.xattrs.is_empty() {
+                println!("│   XAttrs: {} attributes", entry.xattrs.len());
+            }
+            println!("│");
+        }
+
+        if second_only_files.len() > 10 {
+            println!("│ ... and {} more files", second_only_files.len() - 10);
+        }
+        println!("└─────────────────────────────────────────────────────────────────────────────┘");
+    }
+
+    // Files that exist in both but are different (modifications)
+    let mut modified_files: Vec<_> = first_baseline.entries
+        .iter()
+        .filter_map(|(path, first_entry)| {
+            second_baseline.entries.get(path).map(|second_entry| (path, first_entry, second_entry))
+        })
+        .filter(|(_, first_entry, second_entry)| {
+            files_are_different(first_entry, second_entry)
+        })
+        .collect();
+    modified_files.sort_by_key(|(path, _, _)| *path);
+
+    if !modified_files.is_empty() {
+        println!("\n{} {}",
+                 "📁 MODIFIED FILES".yellow().bold(),
+                 format!("({})", modified_files.len()).bright_black());
+        println!("┌─────────────────────────────────────────────────────────────────────────────┐");
+
+        for (path, first_entry, second_entry) in modified_files.iter().take(10) { // Show first 10
+            modifications += 1;
+            changes_found = true;
+            println!("│ {} {}", "~".yellow().bold(), formatter::format_path(path));
+
+            // Show what changed
+            let mut changes = Vec::new();
+
+            if first_entry.hash != second_entry.hash {
+                changes.push(format!("Hash: {} → {}",
+                                     formatter::format_hash(&first_entry.hash),
+                                     formatter::format_hash(&second_entry.hash)));
+            }
+
+            if first_entry.size != second_entry.size {
+                changes.push(format!("Size: {} → {}",
+                                     formatter::format_size(first_entry.size),
+                                     formatter::format_size(second_entry.size)));
+            }
+
+            if first_entry.permissions != second_entry.permissions {
+                changes.push(format!("Perms: {} → {}",
+                                     formatter::format_permission_octal(first_entry.permissions),
+                                     formatter::format_permission_octal(second_entry.permissions)));
+            }
+
+            if first_entry.uid != second_entry.uid || first_entry.gid != second_entry.gid {
+                changes.push(format!("Owner: {}:{} → {}:{}",
+                                     first_entry.uid, first_entry.gid,
+                                     second_entry.uid, second_entry.gid));
+            }
+
+            if first_entry.modified != second_entry.modified {
+                changes.push(format!("Modified: {} → {}",
+                                     formatter::format_timestamp(first_entry.modified),
+                                     formatter::format_timestamp(second_entry.modified)));
+            }
+
+            if first_entry.xattrs != second_entry.xattrs {
+                changes.push(format!("XAttrs: {} → {} attributes",
+                                     first_entry.xattrs.len(),
+                                     second_entry.xattrs.len()));
+            }
+
+            for change in &changes {
+                println!("│   {}", change);
+            }
+            println!("│");
+        }
+
+        if modified_files.len() > 10 {
+            println!("│ ... and {} more files", modified_files.len() - 10);
+        }
+        println!("└─────────────────────────────────────────────────────────────────────────────┘");
+    }
+
+    // Summary
+    println!("\n{}", "📈 SUMMARY".bright_blue().bold());
+    println!("┌─────────────────────────────────────────────────────────────────────────────┐");
+
+    if !changes_found {
+        println!("│ {} No differences found between baselines", "✓".green().bold());
+    } else {
+        println!("│ {} {} files added", "+".green().bold(), additions);
+        println!("│ {} {} files modified", "~".yellow().bold(), modifications);
+        println!("│ {} {} files deleted", "-".red().bold(), deletions);
+        println!("│");
+        println!("│ Total changes: {}", (additions + modifications + deletions).to_string().bright_white().bold());
+    }
+
+    println!("│");
+    println!("│ Time period: {} to {}",
+             formatter::format_timestamp(first_baseline.created_at),
+             formatter::format_timestamp(second_baseline.created_at));
+
+    let time_diff = second_baseline.created_at.signed_duration_since(first_baseline.created_at);
+    if let Ok(duration) = time_diff.to_std() {
+        println!("│ Duration: {}", formatter::format_duration(duration.as_secs()));
+    }
+
+    println!("└─────────────────────────────────────────────────────────────────────────────┘");
 
     Ok(())
+}
+
+// Helper function to determine if two file entries are different
+fn files_are_different(first: &baseline::FileEntry, second: &baseline::FileEntry) -> bool {
+    first.hash != second.hash ||
+        first.size != second.size ||
+        first.permissions != second.permissions ||
+        first.uid != second.uid ||
+        first.gid != second.gid ||
+        first.modified != second.modified ||
+        first.changed != second.changed ||
+        first.xattrs != second.xattrs
 }
 
 fn handle_realtime_monitoring(config: &Config) -> Result<()> {
@@ -738,8 +1147,4 @@ fn wait_for_keypress() -> Result<()> {
     }
     terminal::disable_raw_mode()?;
     Ok(())
-}
-
-fn thread_sleep(millis: u64) {
-    std::thread::sleep(std::time::Duration::from_millis(millis));
 }
