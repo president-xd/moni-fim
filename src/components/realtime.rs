@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use std::io::ErrorKind;
+
 pub struct RealtimeMonitor {
     config: Config,
     monitored_paths: Vec<PathBuf>,
@@ -56,32 +58,52 @@ impl RealtimeMonitor {
 
         if !audit_log_path.exists() {
             return Err(anyhow::anyhow!(
-                "Audit log not found at {:?}. Please ensure auditd is running.",
+                "Audit log not found at {:?}. Please ensure auditd is running and log path is correct.",
                 audit_log_path
             ));
         }
 
-        let file = File::open(audit_log_path)
+        // Initial file setup
+        let mut file = File::open(audit_log_path)
             .context("Failed to open audit log")?;
         let mut reader = BufReader::new(file);
 
-        // Seek to end of file to monitor only new events
+        // Seek to end to monitor only new events
         reader.seek(SeekFrom::End(0))?;
+        let mut last_position = reader.stream_position()?;
 
         let monitored_set: HashSet<PathBuf> = self.monitored_paths.iter().cloned().collect();
-        let mut last_position = reader.stream_position()?;
         let mut event_buffer = String::new();
 
         while self.running.load(Ordering::SeqCst) {
-            // Check for new lines
-            let current_position = reader.stream_position()?;
-            if current_position > last_position {
-                // Read new lines
+            // Handle file rotation/recreation
+            let current_metadata = match std::fs::metadata(audit_log_path) {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    // File might be rotated, wait and retry
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+                Err(e) => return Err(anyhow::anyhow!("Failed to get audit log metadata: {}", e)),
+            };
+
+            // Check if file was recreated (log rotation)
+            let current_size = current_metadata.len();
+            if current_size < last_position {
+                // File was rotated, reopen
+                file = File::open(audit_log_path)
+                    .context("Failed to reopen audit log after rotation")?;
+                reader = BufReader::new(file);
+                last_position = 0;
+            }
+
+            // Check for new content
+            if current_size > last_position {
                 reader.seek(SeekFrom::Start(last_position))?;
 
                 let mut line = String::new();
                 while reader.read_line(&mut line)? > 0 {
-                    // Audit events can span multiple lines
+                    // Process audit events
                     if line.starts_with("type=") {
                         // Process previous event if exists
                         if !event_buffer.is_empty() {
@@ -90,13 +112,13 @@ impl RealtimeMonitor {
                             }
                         }
                         event_buffer = line.clone();
-                    } else {
+                    } else if !line.trim().is_empty() {
                         event_buffer.push_str(&line);
                     }
                     line.clear();
                 }
 
-                // Process last event
+                // Process last event if buffer not empty
                 if !event_buffer.is_empty() {
                     if let Some(event) = parse_audit_event_proper(&event_buffer, &monitored_set) {
                         handle_audit_event(event);
