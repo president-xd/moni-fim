@@ -1,222 +1,155 @@
+// Ed25519 cryptographic signing for MoniFim baselines.
+// Simple API: sign raw bytes, verify raw bytes.
+
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
-use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::Path;
-use base64::Engine;
-use crate::components::logger;
-
-const KEY_DIR: &str = "/etc/moni-fim/keys";
-
-#[derive(Serialize, Deserialize)]
-pub struct SignedData<T> {
-    pub data: T,
-    pub signature: String,
-    pub public_key: String,
-}
+use std::path::{Path, PathBuf};
 
 pub struct CryptoManager {
-    signing_key: SigningKey,
-    verifying_key: VerifyingKey,
+    key_dir: PathBuf,
 }
 
 impl CryptoManager {
-    pub fn new() -> Result<Self> {
-        let (signing_key, verifying_key) = Self::load_or_generate_keypair()?;
-        Ok(Self {
-            signing_key,
-            verifying_key,
-        })
+    /// Create a new CryptoManager pointing at a key directory.
+    /// Does NOT load or generate keys immediately.
+    pub fn new(key_dir: &Path) -> Self {
+        Self { key_dir: key_dir.to_path_buf() }
     }
 
-    fn load_or_generate_keypair() -> Result<(SigningKey, VerifyingKey)> {
-        let key_dir = Path::new(KEY_DIR);
-        fs::create_dir_all(key_dir)
-            .context("Failed to create key directory")?;
+    /// Generate a new Ed25519 keypair and write to disk.
+    pub fn generate_keys(&self) -> Result<()> {
+        fs::create_dir_all(&self.key_dir).context("Failed to create key directory")?;
 
-        let private_key_path = key_dir.join("private.key");
-        let public_key_path = key_dir.join("public.key");
+        let private_key_path = self.key_dir.join("private.key");
+        let public_key_path = self.key_dir.join("public.key");
 
-        if private_key_path.exists() && public_key_path.exists() {
-            // Load existing keypair
-            let mut private_key_bytes = Vec::new();
-            File::open(&private_key_path)?
-                .read_to_end(&mut private_key_bytes)?;
+        let secret: [u8; 32] = {
+            let mut bytes = [0u8; 32];
+            use rand::RngCore;
+            OsRng.fill_bytes(&mut bytes);
+            bytes
+        };
+        let signing_key = SigningKey::from_bytes(&secret);
+        let verifying_key = signing_key.verifying_key();
 
-            let mut public_key_bytes = Vec::new();
-            File::open(&public_key_path)?
-                .read_to_end(&mut public_key_bytes)?;
+        // Write keys with restricted permissions
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Remove existing files first if overwriting
+            let _ = fs::remove_file(&private_key_path);
+            let _ = fs::remove_file(&public_key_path);
 
-            let private_key_array: [u8; 32] = private_key_bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("Invalid private key length, expected 32 bytes"))?;
+            let mut priv_file = fs::OpenOptions::new()
+                .write(true).create_new(true).mode(0o600)
+                .open(&private_key_path)?;
+            priv_file.write_all(&signing_key.to_bytes())?;
+            priv_file.sync_all()?;
 
-            let public_key_array: [u8; 32] = public_key_bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("Invalid public key length, expected 32 bytes"))?;
-
-            let signing_key = SigningKey::from_bytes(&private_key_array);
-            let verifying_key = VerifyingKey::from_bytes(&public_key_array)
-                .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
-
-            Ok((signing_key, verifying_key))
-        } else {
-            // Generate new keypair
-            let mut csprng = OsRng;
-            let secret_key: [u8; 32] = {
-                let mut bytes = [0u8; 32];
-                use rand::RngCore;
-                csprng.fill_bytes(&mut bytes);
-                bytes
-            };
-            let signing_key = SigningKey::from_bytes(&secret_key);
-            let verifying_key = signing_key.verifying_key();
-
-            // Save keys with restricted permissions
-            let mut private_file = File::create(&private_key_path)?;
-            private_file.write_all(&signing_key.to_bytes())?;
-
-            let mut public_file = File::create(&public_key_path)?;
-            public_file.write_all(&verifying_key.to_bytes())?;
-
-            // Set restrictive permissions
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&private_key_path)?.permissions();
-                perms.set_mode(0o600); // Only owner can read/write
-                fs::set_permissions(&private_key_path, perms)?;
-            }
-
-            crate::components::logger::log_crypto_operation(
-                "KEYPAIR_GENERATED",
-                "New Ed25519 keypair generated and saved"
-            );
-
-            Ok((signing_key, verifying_key))
+            let mut pub_file = fs::OpenOptions::new()
+                .write(true).create_new(true).mode(0o644)
+                .open(&public_key_path)?;
+            pub_file.write_all(&verifying_key.to_bytes())?;
+            pub_file.sync_all()?;
         }
-    }
-
-    pub fn sign_data<T: Serialize + for<'de> Deserialize<'de>>(&self, data: &T) -> Result<SignedData<T>> {
-        let serialized = serde_json::to_string(data)?;
-        let signature = self.signing_key.sign(serialized.as_bytes());
-
-        Ok(SignedData {
-            data: serde_json::from_str(&serialized)?,
-            signature: base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
-            public_key: base64::engine::general_purpose::STANDARD.encode(self.verifying_key.to_bytes()),
-        })
-    }
-
-    pub fn verify_signature<T: Serialize + for<'de> Deserialize<'de>>(
-        &self,
-        signed_data: &SignedData<T>,
-    ) -> Result<bool> {
-        let signature_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&signed_data.signature)
-            .context("Failed to decode signature")?;
-
-        let signature_array: [u8; 64] = signature_bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid signature length, expected 64 bytes"))?;
-
-        let signature = Signature::from_bytes(&signature_array);
-
-        let public_key_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&signed_data.public_key)
-            .context("Failed to decode public key")?;
-
-        let public_key_array: [u8; 32] = public_key_bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid public key length, expected 32 bytes"))?;
-
-        let verifying_key = VerifyingKey::from_bytes(&public_key_array)
-            .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
-
-        let serialized = serde_json::to_string(&signed_data.data)?;
-
-        // First try with the stored public key from the signed data
-        let verification_result = verifying_key.verify(serialized.as_bytes(), &signature);
-
-        if verification_result.is_ok() {
-            return Ok(true);
+        #[cfg(not(unix))]
+        {
+            fs::write(&private_key_path, signing_key.to_bytes())?;
+            fs::write(&public_key_path, verifying_key.to_bytes())?;
         }
 
-        // If that fails, try with our current verifying key (for backward compatibility)
-        let fallback_result = self.verifying_key.verify(serialized.as_bytes(), &signature);
-
-        if fallback_result.is_ok() {
-            logger::log_crypto_operation("SIGNATURE_VERIFIED_FALLBACK",
-                                         "Signature verified using current key (baseline may be from different key)");
-            return Ok(true);
-        }
-
-        // Log the failure for debugging
-        logger::log_crypto_operation("SIGNATURE_VERIFICATION_FAILED",
-                                     &format!("Failed to verify signature. Current key fingerprint: {}",
-                                              self.get_key_fingerprint()));
-
-        Ok(false)
+        log::info!("Generated new Ed25519 keypair in {:?}", self.key_dir);
+        Ok(())
     }
 
-    // Add a method to verify without failing
-    pub fn verify_signature_lenient<T: Serialize + for<'de> Deserialize<'de>>(
-        &self,
-        signed_data: &SignedData<T>,
-    ) -> Result<bool> {
-        match self.verify_signature(signed_data) {
-            Ok(result) => Ok(result),
-            Err(_) => {
-                logger::log_crypto_operation("SIGNATURE_VERIFICATION_SKIPPED",
-                                             "Signature verification failed, proceeding without verification");
-                Ok(true) // Allow operation to continue
-            }
-        }
+    /// Load the signing key from disk.
+    fn load_signing_key(&self) -> Result<SigningKey> {
+        let path = self.key_dir.join("private.key");
+        let mut bytes = Vec::new();
+        File::open(&path)
+            .with_context(|| format!("Failed to open private key: {}", path.display()))?
+            .read_to_end(&mut bytes)?;
+        let arr: [u8; 32] = bytes.try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid private key length"))?;
+        Ok(SigningKey::from_bytes(&arr))
     }
 
-    pub fn export_public_key(&self) -> String {
-        base64::engine::general_purpose::STANDARD.encode(self.verifying_key.to_bytes())
+    /// Load the verifying key from disk.
+    fn load_verifying_key(&self) -> Result<VerifyingKey> {
+        let path = self.key_dir.join("public.key");
+        let mut bytes = Vec::new();
+        File::open(&path)
+            .with_context(|| format!("Failed to open public key: {}", path.display()))?
+            .read_to_end(&mut bytes)?;
+        let arr: [u8; 32] = bytes.try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid public key length"))?;
+        VerifyingKey::from_bytes(&arr)
+            .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))
     }
 
-    pub fn export_public_key_hex(&self) -> String {
-        hex::encode(self.verifying_key.to_bytes())
+    /// Sign raw bytes. Returns the 64-byte Ed25519 signature.
+    pub fn sign_data(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let signing_key = self.load_signing_key()?;
+        let sig = signing_key.sign(data);
+        Ok(sig.to_bytes().to_vec())
     }
 
-    pub fn get_key_fingerprint(&self) -> String {
-        let public_bytes = self.verifying_key.to_bytes();
-        let hash = blake3::hash(&public_bytes);
-        let fingerprint = hash.to_hex();
-        format!("{}...{}", &fingerprint[..8], &fingerprint[fingerprint.len()-8..])
+    /// Verify a signature on raw bytes.
+    pub fn verify_signature(&self, data: &[u8], signature: &[u8]) -> Result<()> {
+        let verifying_key = self.load_verifying_key()?;
+        let sig_arr: [u8; 64] = signature.try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid signature length (expected 64 bytes)"))?;
+        let sig = Signature::from_bytes(&sig_arr);
+        verifying_key.verify(data, &sig)
+            .map_err(|_| anyhow::anyhow!("Signature verification failed — data may be tampered"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn setup() -> (TempDir, CryptoManager) {
+        let dir = TempDir::new().unwrap();
+        let crypto = CryptoManager::new(dir.path());
+        crypto.generate_keys().unwrap();
+        (dir, crypto)
+    }
 
     #[test]
     fn test_sign_and_verify() {
-        let crypto = CryptoManager::new().unwrap();
+        let (_dir, crypto) = setup();
+        let data = b"hello monifim";
+        let sig = crypto.sign_data(data).unwrap();
+        assert!(crypto.verify_signature(data, &sig).is_ok());
+    }
 
-        #[derive(Serialize, Deserialize, PartialEq, Clone)]
-        struct TestData {
-            message: String,
-            value: u32,
-        }
+    #[test]
+    fn test_tamper_detection() {
+        let (_dir, crypto) = setup();
+        let data = b"original data";
+        let sig = crypto.sign_data(data).unwrap();
+        let tampered = b"tampered data";
+        assert!(crypto.verify_signature(tampered, &sig).is_err());
+    }
 
-        let data = TestData {
-            message: "Test message".to_string(),
-            value: 42,
-        };
+    #[test]
+    fn test_invalid_signature() {
+        let (_dir, crypto) = setup();
+        let data = b"some data";
+        let bad_sig = vec![0u8; 64];
+        assert!(crypto.verify_signature(data, &bad_sig).is_err());
+    }
 
-        let signed = crypto.sign_data(&data).unwrap();
-        assert!(crypto.verify_signature(&signed).unwrap());
-
-        // Test tampering detection
-        let mut tampered = signed;
-        tampered.data.value = 43;
-        assert!(!crypto.verify_signature(&tampered).unwrap());
+    #[test]
+    fn test_bad_sig_length() {
+        let (_dir, crypto) = setup();
+        let data = b"data";
+        let bad_sig = vec![0u8; 32]; // wrong length
+        assert!(crypto.verify_signature(data, &bad_sig).is_err());
     }
 }
