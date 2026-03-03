@@ -1,13 +1,15 @@
-// src/components/mod.rs
-
 pub mod banner;
 pub mod baseline;
 pub mod cli;
-pub mod combined;
 pub mod config;
 pub mod crypto;
+pub mod events;
 pub mod formatter;
 pub mod hashing;
+pub mod inotify_monitor;
 pub mod logger;
+pub mod permissions;
 pub mod policy;
 pub mod realtime;
+pub mod scanner;
+pub mod service;
