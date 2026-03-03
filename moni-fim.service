@@ -1,0 +1,37 @@
+[Unit]
+Description=MoniFim - Enterprise File Integrity Monitor
+Documentation=https://github.com/president-xd/moni-fim
+After=network.target auditd.service
+Wants=auditd.service
+
+[Service]
+Type=forking
+PIDFile=/var/run/moni-fim.pid
+ExecStart=/usr/local/bin/moni-fim monitor --daemon
+ExecStop=/usr/local/bin/moni-fim service stop
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+
+# Security hardening
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/moni-fim /var/log/moni-fim /var/run /etc/moni-fim
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SYS_PTRACE
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=moni-fim
+
+[Install]
+WantedBy=multi-user.target
