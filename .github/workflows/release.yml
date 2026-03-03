@@ -1,0 +1,203 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: moni-fim
+
+jobs:
+  # ── Run full CI checks before releasing ──────────────────────
+  ci:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-ci-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all
+
+  # ── Build release binaries for multiple targets ──────────────
+  build:
+    name: Build — ${{ matrix.target }}
+    needs: ci
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              sudo apt-get install -y musl-tools
+              ;;
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          ARCHIVE_DIR="${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "${ARCHIVE_DIR}"
+          cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" "${ARCHIVE_DIR}/"
+          cp README.md LICENSE moni-fim.service "${ARCHIVE_DIR}/"
+          tar czf "${ARCHIVE_DIR}.${{ matrix.archive }}" "${ARCHIVE_DIR}"
+          echo "ASSET=${ARCHIVE_DIR}.${{ matrix.archive }}" >> $GITHUB_ENV
+
+      - name: Generate SHA256
+        run: |
+          sha256sum "${{ env.ASSET }}" > "${{ env.ASSET }}.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+
+  # ── Create GitHub Release ────────────────────────────────────
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Extract version from tag
+        id: meta
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | head -2 | tail -1 || echo "")
+          if [ -z "$PREV_TAG" ] || [ "$PREV_TAG" = "${{ github.ref_name }}" ]; then
+            CHANGELOG=$(git log --oneline --no-decorate HEAD | head -50)
+          else
+            CHANGELOG=$(git log --oneline --no-decorate "${PREV_TAG}..HEAD")
+          fi
+          {
+            echo "changelog<<EOF"
+            echo "$CHANGELOG"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "MoniFim v${{ steps.meta.outputs.version }}"
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          generate_release_notes: true
+          body: |
+            ## MoniFim v${{ steps.meta.outputs.version }}
+
+            Enterprise-grade File Integrity Monitoring for Linux.
+
+            ### What's Changed
+            ${{ steps.changelog.outputs.changelog }}
+
+            ### Installation
+
+            ```bash
+            # Download and extract
+            tar xzf moni-fim-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+            sudo cp moni-fim-${{ github.ref_name }}-x86_64-unknown-linux-gnu/moni-fim /usr/local/bin/
+
+            # Initialize
+            sudo moni-fim init
+
+            # (Optional) Install systemd service
+            sudo cp moni-fim-${{ github.ref_name }}-x86_64-unknown-linux-gnu/moni-fim.service /etc/systemd/system/
+            sudo systemctl enable --now moni-fim
+            ```
+
+            ### Verify Downloads
+            Each archive has a `.sha256` checksum file. Verify with:
+            ```bash
+            sha256sum -c moni-fim-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz.sha256
+            ```
+
+            ### Targets
+            | Archive | Platform |
+            |---------|----------|
+            | `x86_64-unknown-linux-gnu` | Linux x86_64 (glibc) |
+            | `x86_64-unknown-linux-musl` | Linux x86_64 (static/musl) |
+            | `aarch64-unknown-linux-gnu` | Linux ARM64 |
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
